@@ -25,7 +25,7 @@ done
 #Trim Herbarium Sequence Reads
 for i in $(cat $BASE/Herbarium_list.txt);
 do $FASTP -i $RAW/$i$S1 -I $RAW/$i$S2 -o $TRIMDIR/$i$S1 -O 
-$TRIMDIR/$i$S2 --trim_poly_x --trim_poly_g --dedup -h 
+$TRIMDIR/$i$S2 --cut_right --dedup -h 
 $TRIMDIR/$i'.html' -g -w 16;
 done
 
@@ -42,16 +42,16 @@ done
 #Run Alignment
 for FILE in $(cat $BASE/Herbarium_list.txt);
 do bwa mem -t 16 $GENOME $DECONDIR/$FILE$S1 $DECONDIR/$FILE$S2 > $ALIGNDIR/$FILE'.sam';
-samtools view -bS $ALIGNDIR/$FILE'.sam' | samtools sort -o $ALIGNDIR/$FILE'.bam';
+samtools view -bS $ALIGNDIR/$FILE'.sam' | samtools sort -@ 48 -o $ALIGNDIR/$FILE'.bam';
 rm $ALIGNDIR/$FILE'.sam';
 done
 
 #Mark Duplicates
 for i in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
-do samtools markdup $ALIGNDIR/$FILE'.bam' $ALIGNDIR/$FILE'marked_.bam'; 
+do samtools markdup -@ 48 $ALIGNDIR/$FILE'.bam' $ALIGNDIR/$FILE'marked_.bam'; 
 done
 
 #Index Bam Files
 for i in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
-do samtools index -b $ALIGNDIR/$FILE'marked_.bam'; 
+do samtools index -@ 48 -b $ALIGNDIR/$FILE'marked_.bam'; 
 done
