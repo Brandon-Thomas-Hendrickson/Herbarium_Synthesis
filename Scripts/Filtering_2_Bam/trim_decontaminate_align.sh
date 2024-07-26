@@ -46,12 +46,28 @@ samtools view -bS $ALIGNDIR/$FILE'.sam' | samtools sort -@ 48 -o $ALIGNDIR/$FILE
 rm $ALIGNDIR/$FILE'.sam';
 done
 
+#Group Sort the Bam Files
+for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt);
+do samtools sort -n -@ 48 $ALIGNDIR/$FILE'.bam' -o $ALIGNDIR/$FILE'grouped_.bam';
+done
+
+#Run Fixmate on bamfiles 
+for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt);
+do 
+  samtools fixmate -@ 48 -m $ALIGNDIR/$FILE'.bam' $ALIGNDIR/$FILE'fixmate_.bam';
+done
+
+#Sort by Coordinate
+for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt);
+do samtools sort -@ 48 -o $ALIGNDIR/$FILE'fixmate_sorted_.bam' $ALIGNDIR/$FILE'fixmate_.bam';
+done
+
 #Mark Duplicates
-for i in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
+for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
 do samtools markdup -@ 48 $ALIGNDIR/$FILE'.bam' $ALIGNDIR/$FILE'marked_.bam'; 
 done
 
 #Index Bam Files
-for i in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
+for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
 do samtools index -@ 48 -b $ALIGNDIR/$FILE'marked_.bam'; 
 done
