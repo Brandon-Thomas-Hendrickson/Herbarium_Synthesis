@@ -71,3 +71,12 @@ done
 for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
 do samtools index -@ 48 -b $ALIGNDIR/$FILE'marked_.bam'; 
 done
+
+#Perform bamtools and qualimap on bamfiles
+for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
+do bamtools stats -in $ALIGNDIR/$FILE'marked_.bam' > $ALIGNDIR/$FILE'_bamstats.txt'; 
+done
+
+for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
+do qualimap bamqc -bam $ALIGNDIR/${FILE}marked_.bam -outdir $ALIGNDIR/${FILE}_qualimap -outfile ${FILE}_qualimap_report.txt -outformat TXT
+done
