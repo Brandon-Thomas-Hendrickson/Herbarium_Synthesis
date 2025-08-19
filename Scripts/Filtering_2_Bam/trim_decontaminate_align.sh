@@ -80,3 +80,25 @@ done
 for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt); 
 do qualimap bamqc -bam $ALIGNDIR/${FILE}marked_.bam -outdir $ALIGNDIR/${FILE}_qualimap -outfile ${FILE}_qualimap_report.txt -outformat TXT
 done
+
+#Downsample bam files with greater than 5X coverage down to avg 3X coverage
+for FILE in $(cat /work/calicraw/Herbarium_Sequences/herbseq_list.txt);
+do
+  # Calculate the initial coverage
+  COVERAGE=$(samtools depth $ALIGNDIR/$FILE'marked_.bam' | awk '{sum+=$3} END {print sum/NR}')
+  
+  # Loop until coverage is between 2X and 4X
+  while (( $(echo "$COVERAGE < 2" | bc -l) || $(echo "$COVERAGE > 4" | bc -l) )); do
+    # Downsample the BAM file
+    samtools view -s 0.6 -b $ALIGNDIR/$FILE'marked_.bam' > $ALIGNDIR/$FILE'temp_downsampled_.bam'
+    
+    # Replace the original BAM file with the downsampled one
+    mv $ALIGNDIR/$FILE'temp_downsampled_.bam' $ALIGNDIR/$FILE'marked_.bam'
+    
+    # Recalculate the coverage
+    COVERAGE=$(samtools depth $ALIGNDIR/$FILE'marked_.bam' | awk '{sum+=$3} END {print sum/NR}')
+  done
+  
+  # Save the final downsampled BAM file
+  mv $ALIGNDIR/$FILE'marked_.bam' $ALIGNDIR/$FILE'downsampled_.bam'
+done

@@ -31,7 +31,7 @@ for K in {1..9}; do
   done
 done
 
-#Run evaladmix on NGSadmix output
+#Run evaladmix on NGSadmix output for cross validation
 cd /work/calicraw/Software/
 git clone https://github.com/GenisGE/evalAdmix.git
 cd evalAdmix
@@ -39,4 +39,19 @@ make
 
 cd /work/calicraw/Herbarium_Sequences/ADMIX
 
+for K in {1..9}; do
+  for seed in 21 1995 7142023 3169147 1964; do
+  /work/calicraw/Software/evalAdmix/evalAdmix -q ADMIX${K}.${seed}.Q -P 48 -o evalADMIX${K}.${seed}
+  done
+done
 
+#From the log output of NGSadmix, extract the K and the log likelihood
+for K in {1..9}; do
+  for seed in 21 1995 7142023 3169147 1964; do
+    grep -A 1 "best like=" ADMIX${K}.${seed}.log | awk -v K=$K -v seed=$seed '{print K, seed, $2}'
+  done
+done > K_likelihood.txt
+
+sed -i 's/like=//g' K_likelihood.txt
+
+awk '{print $1,$3}' K_likelihood.txt > clumppak_ready.txt
