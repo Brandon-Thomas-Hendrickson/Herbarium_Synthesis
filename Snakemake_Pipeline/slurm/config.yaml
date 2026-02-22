@@ -1,0 +1,33 @@
+# =============================================================================
+# Snakemake SLURM profile  (Snakemake >= 8 with snakemake-executor-plugin-slurm)
+# Place this file at:  Snakemake_Pipeline/slurm/config.yaml
+#
+# Usage:
+#   snakemake --profile Snakemake_Pipeline/slurm [other options]
+# =============================================================================
+
+executor: slurm
+
+# Maximum number of concurrent SLURM jobs
+jobs: 100
+
+# Seconds to wait for output files to appear after a job finishes
+latency-wait: 90
+
+# Resubmit failed jobs up to this many times
+retries: 1
+
+# Default resources applied to every rule unless overridden in the Snakefile
+default-resources:
+  slurm_account: loni_trpopgen03
+  slurm_partition: checkpt
+  runtime: 120          # minutes
+  mem_mb: 16000
+  threads: 4
+
+# Directory for SLURM stdout/stderr logs
+slurm-logdir: logs/slurm
+
+# Print the reason each rule is run
+reason: true
+printshellcmds: true

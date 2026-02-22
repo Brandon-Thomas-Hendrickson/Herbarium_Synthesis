@@ -1,0 +1,914 @@
+# =============================================================================
+# Snakefile – Herbarium Population Genomics Pipeline
+#
+# Pipeline flow:
+#   build_database → index_genome
+#         ↓
+#   fastqc → trim → decontaminate → align → namesort → fixmate
+#         → coordsort → markdup → index_bam → bam_stats / qualimap
+#         → downsample
+#         ↓
+#   create_beagle
+#         ↓
+#   ngsrelate → filter_related → get_fourfold → filter_fourfold_beagle
+#         ↓                                  ↓
+#   ngsadmix (K × seed)            pcangsd
+#         ↓
+#   evaladmix → summarize_likelihood
+#
+# Usage:
+#   snakemake --profile slurm -s Snakefile --configfile config.yaml
+# =============================================================================
+
+import os
+import glob
+
+configfile: "config.yaml"
+
+# ---------------------------------------------------------------------------
+# Resolve paths and wildcards from config
+# ---------------------------------------------------------------------------
+BASE        = config["base"]
+GENOME      = config["genome"]
+GENOME_FAI  = config["genome_fai"]
+ANNOTATION  = config["annotation"]
+GENOMEDIR   = config["genomedir"]
+CONTGENOME  = config["contgenome"]
+
+RAW_DIR     = config["raw_dir"]
+FASTQC_DIR  = config["fastqc_dir"]
+TRIM_DIR    = config["trim_dir"]
+CONT_DIR    = config["cont_dir"]
+DECON_DIR   = config["decon_dir"]
+ALIGN_DIR   = config["align_dir"]
+ANGSD_DIR   = config["angsd_dir"]
+ADMIX_DIR   = config["admix_dir"]
+PCA_DIR     = config["pca_dir"]
+DEGEN_DIR   = config["degen_dir"]
+HET_DIR     = config["het_dir"]
+QC_DIR      = config["qc_dir"]
+LOGS_DIR    = config["logs_dir"]
+
+ANCESTRAL_GENOME = config["ancestral_genome"]
+
+CHLORO_BAM_DIR  = config.get("chloro_bam_dir", "")
+CHLORO_DOWN_LIST = config.get("chloro_downsample_list", "")
+CHLORO_DOWN_DIR  = config.get("chloro_downsampled_dir", "")
+
+# Load chloroplast downsampling targets if the list file exists
+CHLORO_SAMPLES = {}
+if CHLORO_DOWN_LIST and os.path.exists(CHLORO_DOWN_LIST):
+    with open(CHLORO_DOWN_LIST) as _cf:
+        for _line in _cf:
+            _parts = _line.strip().split()
+            if len(_parts) == 2 and not _line.startswith("#"):
+                CHLORO_SAMPLES[os.path.splitext(_parts[0])[0]] = _parts[1]
+
+ANGSD       = config["angsd"]
+REALSFS     = config["realsfs"]
+NGSADMIX    = config["ngsadmix"]
+NGSRELATE   = config["ngsrelate"]
+EVALADMIX   = config["evaladmix"]
+
+THREADS_ALIGN = config["threads_align"]
+THREADS_SORT  = config["threads_sort"]
+THREADS_ADMIX = config["threads_admix"]
+THREADS_PCA   = config["threads_pca"]
+
+SNP_PVAL  = config["snp_pval"]
+MIN_MAF   = config["min_maf"]
+MIN_MQ    = config["min_mq"]
+MIN_BQ    = config["min_bq"]
+
+K_MAX  = config["k_max"]
+SEEDS  = config["seeds"]
+KS     = list(range(1, K_MAX + 1))
+
+SLURM_ACCOUNT   = config["slurm_account"]
+SLURM_PARTITION = config["slurm_partition"]
+
+# Detect samples from raw FASTQ directory
+SAMPLES, = glob_wildcards(os.path.join(RAW_DIR, "{sample}_1.fq.gz"))
+
+# ---------------------------------------------------------------------------
+# rule all – declare final targets
+# ---------------------------------------------------------------------------
+rule all:
+    input:
+        # Contamination database
+        expand("{genomedir}/all_genera_index.1.bt2", genomedir=GENOMEDIR),
+        # Per-sample final BAMs
+        expand("{align_dir}/{sample}_downsampled.bam.bai",
+               align_dir=ALIGN_DIR, sample=SAMPLES),
+        # Quality reports
+        expand("{align_dir}/{sample}_bamstats.txt",
+               align_dir=ALIGN_DIR, sample=SAMPLES),
+        # Beagle file
+        f"{ANGSD_DIR}/Herbarium.beagle.gz",
+        # Admixture Q-matrices
+        expand("{admix_dir}/ADMIX{k}.{seed}.Q",
+               admix_dir=ADMIX_DIR, k=KS, seed=SEEDS),
+        # evalAdmix output
+        expand("{admix_dir}/evalADMIX{k}.{seed}.corres",
+               admix_dir=ADMIX_DIR, k=KS, seed=SEEDS),
+        # Log-likelihood summary
+        f"{ADMIX_DIR}/clumppak_ready.txt",
+        # PCA covariance matrix
+        f"{PCA_DIR}/herbarium_pca.cov",
+        # Aggregated QC summaries
+        f"{QC_DIR}/bamstats_summary.csv",
+        f"{QC_DIR}/qualimap_summary.csv",
+        # Per-individual heterozygosity
+        expand("{het_dir}/{sample}.ml", het_dir=HET_DIR, sample=SAMPLES),
+        # Chloroplast downsampling (only if list file present)
+        *([expand("{chloro_down_dir}/{sample}_downsampled.bam",
+                  chloro_down_dir=CHLORO_DOWN_DIR,
+                  sample=list(CHLORO_SAMPLES.keys()))]
+          if CHLORO_SAMPLES else []),
+
+
+# ---------------------------------------------------------------------------
+# Step 1 – Build contamination database (run once)
+# ---------------------------------------------------------------------------
+rule build_database:
+    output:
+        fasta = f"{GENOMEDIR}/GB_BAC_FUN.fasta",
+        index = f"{GENOMEDIR}/all_genera_index.1.bt2",
+    log:
+        f"{LOGS_DIR}/build_database.log"
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 2880,   # 48 h
+        mem_mb   = 32000,
+        threads  = 4,
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {GENOMEDIR} BAC_FUN_GENOMES
+
+        wget -q ftp://ftp.ncbi.nlm.nih.gov/genomes/genbank/bacteria/assembly_summary.txt \
+            -O assembly_summary_bac.txt
+        wget -q ftp://ftp.ncbi.nlm.nih.gov/genomes/genbank/fungi/assembly_summary.txt \
+            -O assembly_summary_fun.txt
+
+        awk -F '\t' '$12=="Complete Genome" {{print $8, $20}}' assembly_summary_bac.txt \
+            > assembly_complete_bac.txt
+        awk -F '\t' '$12=="Complete Genome" {{print $8, $20}}' assembly_summary_fun.txt \
+            > assembly_complete_fun.txt
+
+        cat assembly_complete_bac.txt assembly_complete_fun.txt \
+            | sort -u -k1,1 \
+            | awk '{{print $2}}' \
+            > ftp_list.txt
+
+        while IFS= read -r ftp_path; do
+            [[ "$ftp_path" =~ ^ftp ]] || continue
+            fname="${{ftp_path##*/}}"
+            wget -q "${{ftp_path}}/${{fname}}_genomic.fna.gz" -P BAC_FUN_GENOMES/ || true
+        done < ftp_list.txt
+
+        gunzip -f BAC_FUN_GENOMES/*.gz
+        cat BAC_FUN_GENOMES/*.fna > {output.fasta}
+
+        bowtie2-build --packed {output.fasta} {GENOMEDIR}/all_genera_index \
+            2>&1 | tee {log}
+        """
+
+
+rule index_genome:
+    input:  GENOME
+    output: f"{GENOME}.bwt"
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 120,
+        mem_mb   = 16000,
+        threads  = 1,
+    shell:
+        "bwa index {input}"
+
+
+# ---------------------------------------------------------------------------
+# Step 2a – FastQC on raw reads
+# ---------------------------------------------------------------------------
+rule fastqc:
+    input:
+        r1 = f"{RAW_DIR}/{{sample}}_1.fq.gz",
+        r2 = f"{RAW_DIR}/{{sample}}_2.fq.gz",
+    output:
+        html1 = f"{FASTQC_DIR}/{{sample}}_1_fastqc.html",
+        html2 = f"{FASTQC_DIR}/{{sample}}_2_fastqc.html",
+    threads: 2
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 60,
+        mem_mb   = 4000,
+    shell:
+        "fastqc {input.r1} {input.r2} -o {FASTQC_DIR} -t {threads}"
+
+
+# ---------------------------------------------------------------------------
+# Step 2b – Trim with fastp
+# ---------------------------------------------------------------------------
+rule trim:
+    input:
+        r1 = f"{RAW_DIR}/{{sample}}_1.fq.gz",
+        r2 = f"{RAW_DIR}/{{sample}}_2.fq.gz",
+    output:
+        r1   = f"{TRIM_DIR}/{{sample}}_1.fq.gz",
+        r2   = f"{TRIM_DIR}/{{sample}}_2.fq.gz",
+        html = f"{TRIM_DIR}/{{sample}}.html",
+    threads: THREADS_ALIGN
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 120,
+        mem_mb   = 8000,
+    shell:
+        """
+        fastp \
+            -i {input.r1} -I {input.r2} \
+            -o {output.r1} -O {output.r2} \
+            --cut_right --dedup \
+            -h {output.html} \
+            -g -w {threads}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 2c – Decontaminate with bowtie2
+# ---------------------------------------------------------------------------
+rule decontaminate:
+    input:
+        r1    = f"{TRIM_DIR}/{{sample}}_1.fq.gz",
+        r2    = f"{TRIM_DIR}/{{sample}}_2.fq.gz",
+        index = f"{GENOMEDIR}/all_genera_index.1.bt2",
+    output:
+        r1   = f"{DECON_DIR}/{{sample}}_1.fq.gz",
+        r2   = f"{DECON_DIR}/{{sample}}_2.fq.gz",
+        cont = f"{CONT_DIR}/{{sample}}_CONTAMINATED.bam",
+    threads: THREADS_ALIGN
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 240,
+        mem_mb   = 16000,
+    shell:
+        """
+        set -euo pipefail
+        bowtie2 -p {threads} \
+            -x {CONTGENOME} \
+            -1 {input.r1} -2 {input.r2} \
+            --un-conc-gz {DECON_DIR}/{wildcards.sample}_CLEAN \
+            > {wildcards.sample}_FUN_BAC_REMOVED.sam
+
+        samtools view -hbS -F 4 {wildcards.sample}_FUN_BAC_REMOVED.sam \
+            > {output.cont}
+        rm {wildcards.sample}_FUN_BAC_REMOVED.sam
+
+        mv {DECON_DIR}/{wildcards.sample}_CLEAN.1 {output.r1}
+        mv {DECON_DIR}/{wildcards.sample}_CLEAN.2 {output.r2}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 2d – Align with bwa mem
+# ---------------------------------------------------------------------------
+rule align:
+    input:
+        r1     = f"{DECON_DIR}/{{sample}}_1.fq.gz",
+        r2     = f"{DECON_DIR}/{{sample}}_2.fq.gz",
+        genome = GENOME,
+        index  = f"{GENOME}.bwt",
+    output:
+        bam = f"{ALIGN_DIR}/{{sample}}.bam",
+    threads: THREADS_ALIGN
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 360,
+        mem_mb   = 32000,
+    shell:
+        """
+        bwa mem -t {threads} {input.genome} {input.r1} {input.r2} \
+            | samtools view -bS \
+            | samtools sort -@ {THREADS_SORT} -o {output.bam}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 2e – Query-name sort (required by fixmate)
+# ---------------------------------------------------------------------------
+rule namesort:
+    input:  f"{ALIGN_DIR}/{{sample}}.bam"
+    output: f"{ALIGN_DIR}/{{sample}}_grouped.bam"
+    threads: THREADS_SORT
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 120,
+        mem_mb   = 32000,
+    shell:
+        "samtools sort -n -@ {threads} {input} -o {output}"
+
+
+# ---------------------------------------------------------------------------
+# Step 2f – Fix mate information
+# ---------------------------------------------------------------------------
+rule fixmate:
+    input:  f"{ALIGN_DIR}/{{sample}}_grouped.bam"
+    output: f"{ALIGN_DIR}/{{sample}}_fixmate.bam"
+    threads: THREADS_SORT
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 120,
+        mem_mb   = 32000,
+    shell:
+        "samtools fixmate -@ {threads} -m {input} {output}"
+
+
+# ---------------------------------------------------------------------------
+# Step 2g – Coordinate sort (required by markdup)
+# ---------------------------------------------------------------------------
+rule coordsort:
+    input:  f"{ALIGN_DIR}/{{sample}}_fixmate.bam"
+    output: f"{ALIGN_DIR}/{{sample}}_fixmate_sorted.bam"
+    threads: THREADS_SORT
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 120,
+        mem_mb   = 32000,
+    shell:
+        "samtools sort -@ {threads} {input} -o {output}"
+
+
+# ---------------------------------------------------------------------------
+# Step 2h – Mark duplicates
+# ---------------------------------------------------------------------------
+rule markdup:
+    input:  f"{ALIGN_DIR}/{{sample}}_fixmate_sorted.bam"
+    output: f"{ALIGN_DIR}/{{sample}}_marked.bam"
+    threads: THREADS_SORT
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 120,
+        mem_mb   = 32000,
+    shell:
+        "samtools markdup -@ {threads} {input} {output}"
+
+
+# ---------------------------------------------------------------------------
+# Step 2i – Index marked BAM
+# ---------------------------------------------------------------------------
+rule index_bam:
+    input:  f"{ALIGN_DIR}/{{sample}}_marked.bam"
+    output: f"{ALIGN_DIR}/{{sample}}_marked.bam.bai"
+    threads: THREADS_SORT
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 30,
+        mem_mb   = 4000,
+    shell:
+        "samtools index -@ {threads} {input}"
+
+
+# ---------------------------------------------------------------------------
+# Step 2j – BAM statistics
+# ---------------------------------------------------------------------------
+rule bam_stats:
+    input:  f"{ALIGN_DIR}/{{sample}}_marked.bam"
+    output: f"{ALIGN_DIR}/{{sample}}_bamstats.txt"
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 30,
+        mem_mb   = 4000,
+        threads  = 1,
+    shell:
+        "bamtools stats -in {input} > {output}"
+
+
+rule qualimap:
+    input:  f"{ALIGN_DIR}/{{sample}}_marked.bam"
+    output: directory(f"{ALIGN_DIR}/{{sample}}_qualimap")
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 60,
+        mem_mb   = 8000,
+        threads  = 1,
+    shell:
+        """
+        qualimap bamqc \
+            -bam {input} \
+            -outdir {output} \
+            -outfile {wildcards.sample}_qualimap_report.txt \
+            -outformat TXT
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 2k – Coverage-based downsampling (target: 2–4X mean coverage)
+# ---------------------------------------------------------------------------
+rule downsample:
+    input:
+        bam = f"{ALIGN_DIR}/{{sample}}_marked.bam",
+        bai = f"{ALIGN_DIR}/{{sample}}_marked.bam.bai",
+    output:
+        bam = f"{ALIGN_DIR}/{{sample}}_downsampled.bam",
+        bai = f"{ALIGN_DIR}/{{sample}}_downsampled.bam.bai",
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 120,
+        mem_mb   = 8000,
+        threads  = 1,
+    shell:
+        """
+        set -euo pipefail
+        COVERAGE=$(samtools depth {input.bam} \
+            | awk '{{sum+=$3; n++}} END {{if(n>0) print sum/n; else print 0}}')
+
+        if (( $(echo "$COVERAGE > 4" | bc -l) )); then
+            cp {input.bam} {output.bam}
+            while (( $(echo "$COVERAGE > 4" | bc -l) )); do
+                FRAC=$(echo "3 / $COVERAGE" | bc -l)
+                FRAC=$(echo "if ($FRAC > 1) 1 else $FRAC" | bc -l)
+                samtools view -s $FRAC -b {output.bam} \
+                    -o {ALIGN_DIR}/{wildcards.sample}_tmp.bam
+                mv {ALIGN_DIR}/{wildcards.sample}_tmp.bam {output.bam}
+                COVERAGE=$(samtools depth {output.bam} \
+                    | awk '{{sum+=$3; n++}} END {{if(n>0) print sum/n; else print 0}}')
+            done
+        else
+            cp {input.bam} {output.bam}
+        fi
+        samtools index {output.bam}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 3 – Create Beagle genotype likelihoods with ANGSD
+# ---------------------------------------------------------------------------
+rule create_bam_list:
+    input:
+        expand("{align_dir}/{sample}_downsampled.bam",
+               align_dir=ALIGN_DIR, sample=SAMPLES)
+    output:
+        f"{ANGSD_DIR}/bam_list.txt"
+    run:
+        with open(output[0], "w") as bam_list:
+            for bam in input:
+                bam_list.write(bam + "\n")
+
+
+rule create_beagle:
+    input:
+        bam_list = f"{ANGSD_DIR}/bam_list.txt",
+        genome   = GENOME,
+        fai      = GENOME_FAI,
+    output:
+        beagle = f"{ANGSD_DIR}/Herbarium.beagle.gz",
+        mafs   = f"{ANGSD_DIR}/Herbarium.mafs.gz",
+    threads: 8
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 4320,   # 3 days
+        mem_mb   = 32000,
+    shell:
+        """
+        mkdir -p {ANGSD_DIR}
+        {ANGSD} \
+            -ref   {input.genome} \
+            -fai   {input.fai} \
+            -bam   {input.bam_list} \
+            -SNP_pval    {SNP_PVAL} \
+            -doMajorMinor 4 \
+            -minQ        {MIN_BQ} \
+            -minMapQ     {MIN_MQ} \
+            -doPost      1 \
+            -GL          1 \
+            -doGlf       2 \
+            -minMaf      {MIN_MAF} \
+            -doCounts    1 \
+            -doMaf       2 \
+            -P           {threads} \
+            -out {ANGSD_DIR}/Herbarium
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 4a – ngsRelate: compute pairwise kinship
+# ---------------------------------------------------------------------------
+rule ngsrelate:
+    input:
+        beagle = f"{ANGSD_DIR}/Herbarium.beagle.gz",
+        mafs   = f"{ANGSD_DIR}/Herbarium.mafs.gz",
+    output:
+        freq = f"{ANGSD_DIR}/freq.txt",
+        res  = f"{ANGSD_DIR}/ngsrelate_out.txt",
+    threads: THREADS_ADMIX
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 480,
+        mem_mb   = 32000,
+    shell:
+        """
+        zcat {input.mafs} | cut -f5 | tail -n +2 > {output.freq}
+        N=$(zcat {input.beagle} | head -1 | awk '{{print (NF-3)/3}}')
+        {NGSRELATE} \
+            -g {input.beagle} \
+            -n $N \
+            -f {output.freq} \
+            -O {output.res} \
+            -m 1 \
+            -p {threads} \
+            -i 5000
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 4b – Identify and remove related individuals (r > 0.25)
+# ---------------------------------------------------------------------------
+rule filter_related:
+    input:
+        beagle  = f"{ANGSD_DIR}/Herbarium.beagle.gz",
+        relat   = f"{ANGSD_DIR}/ngsrelate_out.txt",
+    output:
+        indices = f"{ANGSD_DIR}/individuals_to_remove.txt",
+        beagle  = f"{ANGSD_DIR}/Herbarium_filtered.beagle.gz",
+    run:
+        import pandas as pd
+        import gzip
+
+        # Identify individuals to remove
+        df = pd.read_csv(input.relat, sep="\t")
+        to_remove = set()
+        for _, row in df.iterrows():
+            if row["rab"] > 0.25:
+                a, b = int(row["a"]), int(row["b"])
+                if a not in to_remove:
+                    to_remove.add(b)
+
+        with open(output.indices, "w") as f:
+            for idx in sorted(to_remove):
+                f.write(f"{idx}\n")
+
+        # Filter columns from beagle
+        with gzip.open(input.beagle, "rt") as fin, \
+             gzip.open(output.beagle, "wt") as fout:
+            for line in fin:
+                fields = line.rstrip("\n").split("\t")
+                n_samples = (len(fields) - 3) // 3
+                keep = [0, 1, 2]
+                for i in range(n_samples):
+                    if i not in to_remove:
+                        base = 3 + 3 * i
+                        keep += [base, base + 1, base + 2]
+                fout.write("\t".join(fields[c] for c in keep) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Step 4c – Identify 4-fold degenerate sites with degenotate
+# ---------------------------------------------------------------------------
+rule get_fourfold:
+    input:
+        genome     = GENOME,
+        annotation = ANNOTATION,
+    output:
+        bed      = f"{DEGEN_DIR}/degeneracy-all-sites.bed",
+        fourfold = f"{DEGEN_DIR}/degen_4fold.txt",
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 240,
+        mem_mb   = 16000,
+        threads  = 1,
+    shell:
+        """
+        mkdir -p {DEGEN_DIR}
+        degenotate.py -a {input.annotation} -g {input.genome} -o {DEGEN_DIR} -d " "
+        awk '$5==4 {{print $1"_"$2}}' {output.bed} > {output.fourfold}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 4d – Extract 4-fold sites from filtered beagle
+# ---------------------------------------------------------------------------
+rule filter_fourfold_beagle:
+    input:
+        beagle   = f"{ANGSD_DIR}/Herbarium_filtered.beagle.gz",
+        fourfold = f"{DEGEN_DIR}/degen_4fold.txt",
+    output:
+        beagle = f"{ANGSD_DIR}/Herbarium_4fold.beagle.gz",
+    run:
+        import gzip
+        with open(input.fourfold) as f:
+            keep_sites = set(line.strip() for line in f if line.strip())
+        with gzip.open(input.beagle, "rt") as fin, \
+             gzip.open(output.beagle, "wt") as fout:
+            for line in fin:
+                marker = line.split("\t", 1)[0]
+                if marker == "marker" or marker in keep_sites:
+                    fout.write(line)
+
+
+# ---------------------------------------------------------------------------
+# Step 4e – NGSadmix (K = 1..K_MAX, multiple seeds)
+# ---------------------------------------------------------------------------
+rule ngsadmix:
+    input:
+        beagle = f"{ANGSD_DIR}/Herbarium_4fold.beagle.gz",
+    output:
+        qmat = f"{ADMIX_DIR}/ADMIX{{k}}.{{seed}}.Q",
+        log  = f"{ADMIX_DIR}/ADMIX{{k}}.{{seed}}.log",
+    threads: THREADS_ADMIX
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 4320,
+        mem_mb   = 32000,
+    shell:
+        """
+        mkdir -p {ADMIX_DIR}
+        {NGSADMIX} \
+            -likes {input.beagle} \
+            -K {wildcards.k} \
+            -P {threads} \
+            -o {ADMIX_DIR}/ADMIX{wildcards.k}.{wildcards.seed} \
+            -minMaf {MIN_MAF} \
+            -seed {wildcards.seed}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 4f – evalAdmix cross-validation
+# ---------------------------------------------------------------------------
+rule evaladmix:
+    input:
+        beagle = f"{ANGSD_DIR}/Herbarium_4fold.beagle.gz",
+        qmat   = f"{ADMIX_DIR}/ADMIX{{k}}.{{seed}}.Q",
+    output:
+        f"{ADMIX_DIR}/evalADMIX{{k}}.{{seed}}.corres",
+    threads: THREADS_ADMIX
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 240,
+        mem_mb   = 32000,
+    shell:
+        """
+        cd {ADMIX_DIR}
+        {EVALADMIX} \
+            -beagle {input.beagle} \
+            -q {input.qmat} \
+            -P {threads} \
+            -o {ADMIX_DIR}/evalADMIX{wildcards.k}.{wildcards.seed}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 4g – Summarise log-likelihoods for best-K selection
+# ---------------------------------------------------------------------------
+rule summarize_likelihood:
+    input:
+        logs = expand("{admix_dir}/ADMIX{k}.{seed}.log",
+                      admix_dir=ADMIX_DIR, k=KS, seed=SEEDS),
+    output:
+        table  = f"{ADMIX_DIR}/K_likelihood.txt",
+        clumpp = f"{ADMIX_DIR}/clumppak_ready.txt",
+    run:
+        import re
+        rows = []
+        for log_file in input.logs:
+            # Parse K and seed from filename: ADMIX{k}.{seed}.log
+            base   = os.path.basename(log_file)
+            match  = re.match(r"ADMIX(\d+)\.(\d+)\.log", base)
+            if not match:
+                continue
+            k, seed = match.group(1), match.group(2)
+            with open(log_file) as f:
+                content = f.read()
+            m = re.search(r"best like=(-[\d\.]+)", content)
+            if m:
+                rows.append((int(k), int(seed), m.group(1)))
+
+        rows.sort()
+        with open(output.table, "w") as f:
+            for k, seed, like in rows:
+                f.write(f"{k} {seed} {like}\n")
+
+        with open(output.clumpp, "w") as f:
+            for k, seed, like in rows:
+                f.write(f"{k} {like}\n")
+
+
+# ---------------------------------------------------------------------------
+# Step 5 – PCAngsd PCA
+# ---------------------------------------------------------------------------
+rule pcangsd:
+    input:
+        beagle = f"{ANGSD_DIR}/Herbarium_4fold.beagle.gz",
+    output:
+        cov = f"{PCA_DIR}/herbarium_pca.cov",
+        log = f"{PCA_DIR}/herbarium_pca.txt",
+    threads: THREADS_PCA
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 4320,
+        mem_mb   = 32000,
+    shell:
+        """
+        mkdir -p {PCA_DIR}
+        pcangsd \
+            --beagle  {input.beagle} \
+            --threads {threads} \
+            --out     {PCA_DIR}/herbarium_pca \
+            --maf     {MIN_MAF} \
+            --iter    200 \
+            > {output.log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 6 – Aggregate QC summaries
+# Parses per-sample bamtools and qualimap outputs (from step 2) into CSV files.
+# ---------------------------------------------------------------------------
+rule aggregate_bamstats:
+    input:
+        expand("{align_dir}/{sample}_bamstats.txt",
+               align_dir=ALIGN_DIR, sample=SAMPLES),
+    output:
+        f"{QC_DIR}/bamstats_summary.csv",
+    run:
+        import csv
+        os.makedirs(QC_DIR, exist_ok=True)
+        header = ["Sample","Total reads","Mapped reads","Forward strand",
+                  "Reverse strand","Failed QC","Duplicates","Paired-end reads",
+                  "Proper-pairs","Both pairs mapped","Read 1","Read 2","Singletons"]
+
+        def _field(lines, label, col):
+            for ln in lines:
+                if label in ln:
+                    parts = ln.split()
+                    return parts[col] if len(parts) > col else ""
+            return ""
+
+        with open(output[0], "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(header)
+            for stats_file in input:
+                sample = os.path.basename(stats_file).replace("_bamstats.txt", "")
+                with open(stats_file) as f:
+                    lines = f.readlines()
+                writer.writerow([
+                    sample,
+                    _field(lines, "Total reads",       2),
+                    _field(lines, "Mapped reads",      2),
+                    _field(lines, "Forward strand",    2),
+                    _field(lines, "Reverse strand",    2),
+                    _field(lines, "Failed QC",         2),
+                    _field(lines, "Duplicates",        1),
+                    _field(lines, "Paired-end reads",  2),
+                    _field(lines, "Proper-pairs",      1),
+                    _field(lines, "Both pairs mapped", 3),
+                    _field(lines, "Read 1",            2),
+                    _field(lines, "Read 2",            2),
+                    _field(lines, "Singletons",        1),
+                ])
+
+
+rule aggregate_qualimap:
+    input:
+        expand("{align_dir}/{sample}_qualimap/genome_results.txt",
+               align_dir=ALIGN_DIR, sample=SAMPLES),
+    output:
+        f"{QC_DIR}/qualimap_summary.csv",
+    run:
+        import csv, re
+        os.makedirs(QC_DIR, exist_ok=True)
+        header = ["Sample","number of reads","number of mapped reads",
+                  "number of supplementary alignments","number of secondary alignments",
+                  "number of duplicated reads","duplication rate","mean mapping quality",
+                  "GC percentage","general error rate","mean coverageData","std coverageData"]
+
+        def _qfield(text, label):
+            # Find line with label; return last whitespace token, stripping commas
+            for line in text.splitlines():
+                if label in line:
+                    return line.split()[-1].replace(",", "")
+            return ""
+
+        with open(output[0], "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(header)
+            for res_file in input:
+                # genome_results.txt lives in {sample}_qualimap/
+                sample = os.path.basename(
+                    os.path.dirname(res_file)
+                ).replace("_qualimap", "")
+                with open(res_file) as f:
+                    text = f.read()
+                writer.writerow([
+                    sample,
+                    _qfield(text, "number of reads"),
+                    _qfield(text, "number of mapped reads"),
+                    _qfield(text, "number of supplementary alignments"),
+                    _qfield(text, "number of secondary alignments"),
+                    _qfield(text, "number of duplicated reads"),
+                    _qfield(text, "duplication rate"),
+                    _qfield(text, "mean mapping quality"),
+                    _qfield(text, "GC percentage"),
+                    _qfield(text, "general error rate"),
+                    _qfield(text, "mean coverageData"),
+                    _qfield(text, "std coverageData"),
+                ])
+
+
+# ---------------------------------------------------------------------------
+# Step 7 – Per-individual heterozygosity (ANGSD doSaf + realSFS)
+# ---------------------------------------------------------------------------
+rule hetero_calc_ind:
+    input:
+        bam    = f"{ALIGN_DIR}/{{sample}}_downsampled.bam",
+        bai    = f"{ALIGN_DIR}/{{sample}}_downsampled.bam.bai",
+        genome = GENOME,
+        fai    = GENOME_FAI,
+        anc    = ANCESTRAL_GENOME,
+    output:
+        saf = f"{HET_DIR}/{{sample}}.saf.idx",
+        ml  = f"{HET_DIR}/{{sample}}.ml",
+    threads: 8
+    resources:
+        slurm_account   = SLURM_ACCOUNT,
+        slurm_partition = SLURM_PARTITION,
+        runtime  = 4320,
+        mem_mb   = 16000,
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {HET_DIR}
+
+        # Write a per-sample BAM list (ANGSD requires a file)
+        echo "{input.bam}" > {HET_DIR}/{wildcards.sample}_bam.txt
+
+        {ANGSD} \
+            -bam      {HET_DIR}/{wildcards.sample}_bam.txt \
+            -ref      {input.genome} \
+            -fai      {input.fai} \
+            -anc      {input.anc} \
+            -out      {HET_DIR}/{wildcards.sample} \
+            -doSaf    1 \
+            -GL       1 \
+            -doCounts 1 \
+            -minQ     {MIN_BQ} \
+            -minMapQ  {MIN_MQ} \
+            -C        50 \
+            -P        {threads}
+
+        rm -f {HET_DIR}/{wildcards.sample}_bam.txt
+
+        {REALSFS} \
+            {output.saf} \
+            -maxiter 2000 \
+            -tole    1e-8 \
+            > {output.ml}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 8 – Chloroplast fixed-fraction downsampling (optional)
+# ---------------------------------------------------------------------------
+if CHLORO_SAMPLES:
+    # Build a lookup: wildcard sample name → fraction
+    _fractions = CHLORO_SAMPLES
+
+    rule chloroplast_downsample:
+        input:
+            bam = lambda wc: f"{CHLORO_BAM_DIR}/{wc.csample}.bam",
+        output:
+            bam = f"{CHLORO_DOWN_DIR}/{{csample}}_downsampled.bam",
+            bai = f"{CHLORO_DOWN_DIR}/{{csample}}_downsampled.bam.bai",
+        params:
+            fraction = lambda wc: _fractions[wc.csample],
+        resources:
+            slurm_account   = SLURM_ACCOUNT,
+            slurm_partition = SLURM_PARTITION,
+            runtime  = 60,
+            mem_mb   = 4000,
+            threads  = 1,
+        shell:
+            """
+            mkdir -p {CHLORO_DOWN_DIR}
+            samtools view -s {params.fraction} -b {input.bam} -o {output.bam}
+            samtools index {output.bam}
+            """

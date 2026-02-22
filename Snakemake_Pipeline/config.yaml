@@ -1,0 +1,98 @@
+# =============================================================================
+# config.yaml  –  Herbarium Snakemake Pipeline Configuration
+# Edit this file before running the pipeline.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Base working directory
+# ---------------------------------------------------------------------------
+base: /work/calicraw
+
+# ---------------------------------------------------------------------------
+# Reference genome
+# ---------------------------------------------------------------------------
+genome: /work/calicraw/Genome/GCA_030408175.1_UTM_Trep_v1.0_genomic.fna
+genome_fai: /work/calicraw/Genome/GCA_030408175.1_UTM_Trep_v1.0_genomic.fna.fai
+annotation: /work/calicraw/Genome/GCA_030408175.1_UTM_Trep_v1.0_genomic.gff
+
+# ---------------------------------------------------------------------------
+# Ancestral genome (used for doSaf polarisation in hetero_calc)
+# ---------------------------------------------------------------------------
+ancestral_genome: /work/calicraw/Genome/T_ancestral.fa
+
+# ---------------------------------------------------------------------------
+# Contamination database (output of the build_database rule)
+# ---------------------------------------------------------------------------
+genomedir: /work/calicraw/Genome
+contgenome: /work/calicraw/Genome/all_genera_index   # bowtie2 index prefix
+
+# ---------------------------------------------------------------------------
+# Input directory – raw paired FASTQ files named <sample>_1.fq.gz/_2.fq.gz
+# ---------------------------------------------------------------------------
+raw_dir: /work/calicraw/Herbarium_Sequences
+
+# ---------------------------------------------------------------------------
+# Output directories
+# ---------------------------------------------------------------------------
+fastqc_dir:  /work/calicraw/Herbarium_Sequences/FastQC
+trim_dir:    /work/calicraw/Herbarium_Sequences/Trimmed
+cont_dir:    /work/calicraw/Herbarium_Sequences/Contaminated
+decon_dir:   /work/calicraw/Herbarium_Sequences/Decontaminated
+align_dir:   /work/calicraw/Herbarium_Sequences/Aligned
+angsd_dir:   /work/calicraw/Herbarium_Sequences/ANGSDout
+admix_dir:   /work/calicraw/Herbarium_Sequences/ADMIX
+pca_dir:     /work/calicraw/Herbarium_Sequences/PCA
+degen_dir:   /work/calicraw/degen
+het_dir:     /work/calicraw/Herbarium_Sequences/Heterozygosity
+qc_dir:      /work/calicraw/Herbarium_Sequences/QC_Summary
+logs_dir:    /work/calicraw/logs
+
+# ---------------------------------------------------------------------------
+# Chloroplast downsampling (optional – only needed for the chloroplast_downsample rule)
+# Two-column TSV: <sample.bam>  <fraction>   (fraction = proportion to keep, 0-1)
+# ---------------------------------------------------------------------------
+chloro_downsample_list: /work/calicraw/downsampling_chloroplast_list.txt
+chloro_bam_dir:         /work/calicraw/Herbarium_Sequences/Aligned/chloroplast
+chloro_downsampled_dir: /work/calicraw/Herbarium_Sequences/Aligned/chloroplast/downsampled
+
+# ---------------------------------------------------------------------------
+# Software – paths to compiled binaries (not in conda)
+# ---------------------------------------------------------------------------
+angsd:      /work/calicraw/Software/angsd/angsd
+realsfs:    /work/calicraw/Software/angsd/misc/realSFS
+ngsadmix:   /work/calicraw/Software/angsd/misc/NGSadmix
+ngsrelate:  /work/calicraw/Software/ngsRelate/ngsRelate
+evaladmix:  /work/calicraw/Software/evalAdmix/evalAdmix
+
+# ---------------------------------------------------------------------------
+# Thread / resource settings
+# ---------------------------------------------------------------------------
+threads_align:  16    # fastp, bowtie2, bwa mem
+threads_sort:   48    # samtools sort / fixmate / markdup
+threads_admix:  48    # NGSadmix, evalAdmix, ngsRelate
+threads_pca:    24    # PCAngsd
+
+# ---------------------------------------------------------------------------
+# ANGSD SNP / quality filters
+# ---------------------------------------------------------------------------
+snp_pval: 1e-6
+min_maf:  0.05
+min_mq:   30
+min_bq:   20
+
+# ---------------------------------------------------------------------------
+# NGSadmix parameters
+# ---------------------------------------------------------------------------
+k_max: 9
+seeds:
+  - 21
+  - 1995
+  - 7142023
+  - 3169147
+  - 1964
+
+# ---------------------------------------------------------------------------
+# SLURM (used by the profile; also embedded in resources blocks)
+# ---------------------------------------------------------------------------
+slurm_account:   loni_trpopgen03
+slurm_partition: checkpt
